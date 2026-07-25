@@ -11,8 +11,9 @@ def run_backtest(strategy_df, lambda_params,
                  zi_spread_pct=0.02,
                  dt_minutes=15,
                  strategy='el_aoud',
-                 heston_p = None,
-                 epsilon = 0.1) -> tuple:
+                 heston_p=None,
+                 epsilon=0.1,
+                 seed=42) -> tuple:
     """
     Simulate market making strategy on test period.
 
@@ -21,6 +22,12 @@ def run_backtest(strategy_df, lambda_params,
         2. Simulate order arrivals (Poisson process)
         3. Update inventory, cash, delta hedge
         4. Record wealth and P&L
+
+    Arrival draws are pre-generated from `seed`, so passing the same seed to
+    every strategy gives common random numbers (paired comparison).
+
+    Path metrics (drawdown, fills, inventory, spread income) are accumulated
+    across ALL sims, not read off sim 0.
 
     Parameters:
         strategy_df   : DataFrame  per-timestamp strategy inputs
@@ -31,59 +38,84 @@ def run_backtest(strategy_df, lambda_params,
         dt_minutes    : float      interval length in minutes
         strategy      : str        'el_aoud' | 'el_aoud_risk_averse'
                                    | 'zero_intelligence'
+        seed          : int        RNG seed
 
     Returns:
-        terminal_wealth : np.array  shape (n_sims,)
-        path_df         : DataFrame single simulation path (sim 0)
+        terminal_wealth   : np.array  shape (n_sims,)
+        final_inventories : np.array  shape (n_sims,)
+        path_df           : DataFrame single simulation path (sim 0)
+        stats             : dict of np.array (n_sims,) per-sim path metrics
     """
-    terminal_wealth = np.zeros(n_sims)
-    final_inventories  = np.zeros(n_sims)  # ← add this
+    # ── hoist columns out of the inner loop ──────────────────────────────
+    dts     = strategy_df['datetime'].to_numpy()
+    C_Q_a   = strategy_df['C_Q'].to_numpy(dtype=float)
+    S_a     = strategy_df['S'].to_numpy(dtype=float)
+    delta_a = strategy_df['delta'].to_numpy(dtype=float)
+    M0_a    = strategy_df['M0'].to_numpy(dtype=float)
+    v_t_a   = strategy_df['v_t'].to_numpy(dtype=float)
+    T_a     = strategy_df['T'].to_numpy(dtype=float)
+    n       = len(C_Q_a)
+
+    # ── common random numbers ────────────────────────────────────────────
+    rng = np.random.default_rng(seed)
+    U   = rng.random((n_sims, n, 2))    # [:, :, 0] = ask, [:, :, 1] = bid
+
+    # ── precompute quotes/probs where they don't depend on inventory ─────
+    path_independent = strategy in ('el_aoud', 'zero_intelligence')
+    if path_independent:
+        if strategy == 'el_aoud':
+            _q   = [el_aoud_quotes(M0=M0_a[i], C_Q=C_Q_a[i], B_param=B_param)
+                    for i in range(n)]
+            dp_a = np.array([x[0] for x in _q])
+            dm_a = np.array([x[1] for x in _q])
+        else:
+            dp_a = C_Q_a * zi_spread_pct
+            dm_a = C_Q_a * zi_spread_pct
+
+        p_ask_a = np.array([arrival_probability(dp_a[i], C_Q_a[i],
+                                                lambda_params, dt_minutes)
+                            for i in range(n)])
+        p_bid_a = np.array([arrival_probability(dm_a[i], C_Q_a[i],
+                                                lambda_params, dt_minutes)
+                            for i in range(n)])
+
+    # ── accumulators ─────────────────────────────────────────────────────
+    terminal_wealth   = np.zeros(n_sims)
+    final_inventories = np.zeros(n_sims)
+    stats = {k: np.zeros(n_sims) for k in
+             ('max_drawdown', 'total_fills', 'ask_fills', 'bid_fills',
+              'spread_income', 'mean_abs_inv', 'max_abs_inv', 'inv_std')}
     path_df = None
 
     for sim in range(n_sims):
-        q1   = 0.0
-        q2   = 0.0
-        cash = 0.0
+        q1 = q2 = cash = 0.0
+        W_hist  = np.empty(n)
+        q1_hist = np.empty(n)
+        ask_f = bid_f = 0
+        spr_tot = 0.0
         path = []
 
-        for _, row in strategy_df.iterrows():
-            C_Q   = row['C_Q']
-            S     = row['S']
-            delta = row['delta']
-            M0    = row['M0']
-            v_t   = row['v_t']
-            T     = row['T']
+        for i in range(n):
+            C_Q, S, delta = C_Q_a[i], S_a[i], delta_a[i]
 
             # ── compute quotes ──────────────────────────────
-            if strategy == 'el_aoud':
-                dp, dm = el_aoud_quotes(
-                    M0=M0, C_Q=C_Q, B_param=B_param
-                )
-
-            # in backtest.py, pass epsilon
-            elif strategy == 'el_aoud_risk_averse':
+            if path_independent:
+                dp, dm = dp_a[i], dm_a[i]
+                p_ask, p_bid = p_ask_a[i], p_bid_a[i]
+            else:  # risk-averse — quotes depend on current inventory
                 dp, dm = el_aoud_quotes_risk_averse(
-                    M0=M0, C_Q=C_Q, q1=q1,
-                    delta=delta, v_t=v_t, S=S, T=T,
+                    M0=M0_a[i], C_Q=C_Q, q1=q1,
+                    delta=delta, v_t=v_t_a[i], S=S, T=T_a[i],
                     B_param=B_param,
                     heston_p=heston_p,
                     epsilon=epsilon
                 )
-
-            else:  # zero_intelligence
-                dp = C_Q * zi_spread_pct
-                dm = C_Q * zi_spread_pct
+                p_ask = arrival_probability(dp, C_Q, lambda_params, dt_minutes)
+                p_bid = arrival_probability(dm, C_Q, lambda_params, dt_minutes)
 
             # ── simulate fills ───────────────────────────────
-            p_ask = arrival_probability(
-                dp, C_Q, lambda_params, dt_minutes
-            )
-            p_bid = arrival_probability(
-                dm, C_Q, lambda_params, dt_minutes
-            )
-
-            fill_ask = np.random.random() < p_ask
-            fill_bid = np.random.random() < p_bid
+            fill_ask = U[sim, i, 0] < p_ask
+            fill_bid = U[sim, i, 1] < p_bid
 
             spread_income = 0.0
 
@@ -91,11 +123,15 @@ def run_backtest(strategy_df, lambda_params,
                 cash          += C_Q + dp
                 q1            -= 1
                 spread_income += dp
+                ask_f         += 1
 
             if fill_bid:
                 cash          -= C_Q - dm
                 q1            += 1
                 spread_income += dm
+                bid_f         += 1
+
+            spr_tot += spread_income
 
             # ── delta hedge rebalance ────────────────────────
             q2_new     = -q1 * delta
@@ -105,15 +141,17 @@ def run_backtest(strategy_df, lambda_params,
 
             # ── total wealth (cash + option + stock hedge) ───
             W = cash + q1 * C_Q + q2 * S
+            W_hist[i]  = W
+            q1_hist[i] = q1
 
             if sim == 0:
                 path.append({
-                    'datetime'     : row['datetime'],
+                    'datetime'     : dts[i],
                     'C_Q'          : C_Q,
                     'S'            : S,
-                    'M0'           : M0,
-                    'v_t'          : v_t,
-                    'T'            : T,
+                    'M0'           : M0_a[i],
+                    'v_t'          : v_t_a[i],
+                    'T'            : T_a[i],
                     'delta'        : delta,
                     'delta_plus'   : dp,
                     'delta_minus'  : dm,
@@ -128,109 +166,114 @@ def run_backtest(strategy_df, lambda_params,
                 })
 
         # terminal wealth includes all positions
-        last_row = strategy_df.iloc[-1]
-        terminal_wealth[sim] = (
-            cash +
-            q1 * last_row['C_Q'] +
-            q2 * last_row['S']
-        )
+        terminal_wealth[sim]   = cash + q1 * C_Q_a[-1] + q2 * S_a[-1]
         final_inventories[sim] = q1
 
-        # in run_backtest, after the inner loop:
+        stats['max_drawdown'][sim]  = (np.maximum.accumulate(W_hist)
+                                       - W_hist).max()
+        stats['total_fills'][sim]   = ask_f + bid_f
+        stats['ask_fills'][sim]     = ask_f
+        stats['bid_fills'][sim]     = bid_f
+        stats['spread_income'][sim] = spr_tot
+        stats['mean_abs_inv'][sim]  = np.abs(q1_hist).mean()
+        stats['max_abs_inv'][sim]   = np.abs(q1_hist).max()
+        stats['inv_std'][sim]       = q1_hist.std()
 
         if sim == 0:
             path_df = pd.DataFrame(path)
 
-    
-    return terminal_wealth, final_inventories, path_df
+    return terminal_wealth, final_inventories, path_df, stats
 
 
-def compute_metrics(terminal_wealth, path_df, label='') -> dict:
+def compute_metrics(terminal_wealth, final_inventories, stats,
+                    label='', n_steps=None) -> dict:
 
-    W  = path_df['W'].values
+    tw    = terminal_wealth
+    fills = stats['total_fills']
+    spr   = stats['spread_income']
 
-    # terminal wealth distribution
-    total_pnl  = terminal_wealth.mean()
-    median_pnl = np.median(terminal_wealth)
-    pnl_std    = terminal_wealth.std()
-    pnl_skew   = pd.Series(terminal_wealth).skew()
-    pnl_kurt   = pd.Series(terminal_wealth).kurt()
+    # per FILL, not per filled step — a two-sided step contributes dp + dm
+    avg_spread = spr.sum() / max(fills.sum(), 1)
 
-    # drawdown
-    running_max = np.maximum.accumulate(W)
-    max_dd      = (running_max - W).max()
+    m = {
+        'total_pnl'   : tw.mean(),
+        'median_pnl'  : np.median(tw),
+        'pnl_std'     : tw.std(),
+        'pnl_skew'    : pd.Series(tw).skew(),
+        'pnl_kurt'    : pd.Series(tw).kurt(),
+        'pnl_p5'      : np.percentile(tw, 5),
+        'pnl_p95'     : np.percentile(tw, 95),
 
-    # fill statistics
-    fills       = path_df['fill_ask'] + path_df['fill_bid']
-    fill_rate   = fills.mean()
-    total_fills = fills.sum()
+        'max_drawdown'     : stats['max_drawdown'].mean(),
+        'max_drawdown_p95' : np.percentile(stats['max_drawdown'], 95),
 
-    nonzero    = path_df['spread_income'][path_df['spread_income'] > 0]
-    avg_spread = nonzero.mean() if len(nonzero) > 0 else 0.0
+        'total_fills' : fills.mean(),
+        'ask_fills'   : stats['ask_fills'].mean(),
+        'bid_fills'   : stats['bid_fills'].mean(),
+        'ask_share'   : stats['ask_fills'].sum() / max(fills.sum(), 1),
+        'fill_rate'   : fills.mean() / n_steps if n_steps else np.nan,
+        'avg_spread'  : avg_spread,
 
-    # inventory statistics
-    mean_inv   = path_df['q1'].abs().mean()
-    max_inv    = path_df['q1'].abs().max()
-    final_inv  = path_df['q1'].iloc[-1]
-    inv_std    = path_df['q1'].std()
+        'mean_inventory'  : stats['mean_abs_inv'].mean(),
+        'max_inventory'   : stats['max_abs_inv'].mean(),
+        'final_inventory' : final_inventories.mean(),
+        'final_inv_p5'    : np.percentile(final_inventories, 5),
+        'final_inv_p95'   : np.percentile(final_inventories, 95),
+        'inventory_std'   : stats['inv_std'].mean(),
 
-    # spread income
-    total_spread = path_df['spread_income'].sum()
+        'total_spread_income': spr.mean(),
+        'spread_pct_of_pnl'  : spr.mean() / tw.mean() if tw.mean() else np.nan,
+    }
 
     if label:
-        print(f"\n{'='*55}")
-        print(f"  {label}")
-        print(f"{'='*55}")
-        print(f"  Mean terminal PnL:       ${total_pnl:>12.2f}")
-        print(f"  Median terminal PnL:     ${median_pnl:>12.2f}")
-        print(f"  PnL std:                 ${pnl_std:>12.2f}")
-        print(f"  PnL skewness:            {pnl_skew:>12.4f}")
-        print(f"  PnL kurtosis:            {pnl_kurt:>12.4f}")
-        print(f"  Max drawdown:            ${max_dd:>12.2f}")
-        print(f"  Total fills:             {total_fills:>12.0f}")
-        print(f"  Fill rate per step:      {fill_rate:>12.4f}")
-        print(f"  Avg spread per fill:     ${avg_spread:>12.2f}")
-        print(f"  Mean |inventory|:        {mean_inv:>12.4f}")
-        print(f"  Max |inventory|:         {max_inv:>12.0f}")
-        print(f"  Final inventory:         {final_inv:>12.0f}")
-        print(f"  Inventory std:           {inv_std:>12.4f}")
-        print(f"  Total spread income:     ${total_spread:>12.2f}")
+        print(f"\n{'='*58}")
+        print(f"  {label}   (n = {len(tw)} simulations)")
+        print(f"{'='*58}")
+        print(f"  Mean terminal PnL:       ${m['total_pnl']:>12.2f}")
+        print(f"  Median terminal PnL:     ${m['median_pnl']:>12.2f}")
+        print(f"  PnL std:                 ${m['pnl_std']:>12.2f}")
+        print(f"  PnL 5th / 95th pct:      ${m['pnl_p5']:>12.2f} / ${m['pnl_p95']:.2f}")
+        print(f"  PnL skewness:            {m['pnl_skew']:>12.4f}")
+        print(f"  PnL kurtosis:            {m['pnl_kurt']:>12.4f}")
+        print(f"  --- path metrics, mean across sims ---")
+        print(f"  Max drawdown:            ${m['max_drawdown']:>12.2f}")
+        print(f"  Max drawdown 95th pct:   ${m['max_drawdown_p95']:>12.2f}")
+        print(f"  Total fills:             {m['total_fills']:>12.2f}")
+        print(f"    ask fills:             {m['ask_fills']:>12.2f}")
+        print(f"    bid fills:             {m['bid_fills']:>12.2f}")
+        print(f"    ask share of fills:    {m['ask_share']:>12.2%}")
+        print(f"  Fill rate per step:      {m['fill_rate']:>12.4f}")
+        print(f"  Avg spread per fill:     ${m['avg_spread']:>12.2f}")
+        print(f"  Mean |inventory|:        {m['mean_inventory']:>12.4f}")
+        print(f"  Max |inventory|:         {m['max_inventory']:>12.2f}")
+        print(f"  Final inventory:         {m['final_inventory']:>12.2f}")
+        print(f"  Final inv 5th / 95th:    {m['final_inv_p5']:>12.2f} / {m['final_inv_p95']:.2f}")
+        print(f"  Inventory std:           {m['inventory_std']:>12.4f}")
+        print(f"  Total spread income:     ${m['total_spread_income']:>12.2f}")
+        print(f"  Spread as % of PnL:      {m['spread_pct_of_pnl']:>12.1%}")
 
-    return {
-        'total_pnl'          : total_pnl,
-        'median_pnl'         : median_pnl,
-        'pnl_std'            : pnl_std,
-        'pnl_skew'           : pnl_skew,
-        'pnl_kurt'           : pnl_kurt,
-        'max_drawdown'       : max_dd,
-        'total_fills'        : total_fills,
-        'fill_rate'          : fill_rate,
-        'avg_spread'         : avg_spread,
-        'mean_inventory'     : mean_inv,
-        'max_inventory'      : max_inv,
-        'final_inventory'    : final_inv,
-        'inventory_std'      : inv_std,
-        'total_spread_income': total_spread
-    }
+    return m
+
 
 def compare_strategies(*args) -> pd.DataFrame:
 
     metrics_list = [
-    ('Mean Terminal PnL ($)',  'total_pnl',           '${:.2f}'),
-    ('Median Terminal PnL ($)','median_pnl',          '${:.2f}'),
-    ('PnL Std ($)',            'pnl_std',             '${:.2f}'),
-    ('PnL Skewness',           'pnl_skew',            '{:.4f}'),
-    ('PnL Kurtosis',           'pnl_kurt',            '{:.4f}'),
-    ('Max Drawdown ($)',       'max_drawdown',        '${:.2f}'),
-    ('Total Fills',            'total_fills',         '{:.0f}'),
-    ('Fill Rate per Step',     'fill_rate',           '{:.4f}'),
-    ('Avg Spread/Fill ($)',    'avg_spread',          '${:.2f}'),
-    ('Mean |Inventory|',       'mean_inventory',      '{:.4f}'),
-    ('Max |Inventory|',        'max_inventory',       '{:.0f}'),
-    ('Final Inventory',        'final_inventory',     '{:.0f}'),
-    ('Inventory Std',          'inventory_std',       '{:.4f}'),
-    ('Spread Income ($)',      'total_spread_income', '${:.2f}'),
-]
+        ('Mean Terminal PnL ($)',   'total_pnl',           '${:,.0f}'),
+        ('Median Terminal PnL ($)', 'median_pnl',          '${:,.0f}'),
+        ('PnL Std ($)',             'pnl_std',             '${:,.0f}'),
+        ('PnL 5th pct ($)',         'pnl_p5',              '${:,.0f}'),
+        ('PnL 95th pct ($)',        'pnl_p95',             '${:,.0f}'),
+        ('Mean Max Drawdown ($)',   'max_drawdown',        '${:,.0f}'),
+        ('Max DD 95th pct ($)',     'max_drawdown_p95',    '${:,.0f}'),
+        ('Mean Total Fills',        'total_fills',         '{:.1f}'),
+        ('Ask Share of Fills',      'ask_share',           '{:.1%}'),
+        ('Fill Rate per Step',      'fill_rate',           '{:.4f}'),
+        ('Avg Spread/Fill ($)',     'avg_spread',          '${:,.2f}'),
+        ('Mean |Inventory|',        'mean_inventory',      '{:.1f}'),
+        ('Mean Final Inventory',    'final_inventory',     '{:.1f}'),
+        ('Spread Income ($)',       'total_spread_income', '${:,.0f}'),
+        ('Spread % of PnL',         'spread_pct_of_pnl',   '{:.0%}'),
+    ]
 
     rows = []
     for display_name, key, fmt in metrics_list:
